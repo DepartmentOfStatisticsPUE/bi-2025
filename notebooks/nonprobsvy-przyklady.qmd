@@ -1,0 +1,420 @@
+---
+title: "Pakiet nonprobsvy -- przegląd metod"
+format:
+  html:
+    self-contained: true
+    table-of-contents: true
+    number-sections: true
+editor: source
+execute:
+  eval: true
+  warning: false
+  message: false
+---
+
+# Przygotowanie danych
+
+Ładujemy pakiet `nonprobsvy` oraz pakiety do diagnostyki wag.
+
+```{r}
+library(nonprobsvy) ## wersja 0.2.1
+library(survey)
+library(cobalt)
+library(WeightIt)
+```
+
+Dane wbudowane w pakiet:
+
+- `admin` -- próba nielosowa $S_A$ (dane z CBOP, Centralnej Bazy Ofert Pracy)
+- `jvs` -- próba losowa $S_B$ (dane z badania popytu na pracę)
+
+```{r}
+data(admin)
+data(jvs)
+head(admin)
+head(jvs)
+```
+
+Schemat losowania próby losowej -- potrzebny do poprawnej estymacji wariancji.
+
+```{r}
+jvs_svy <- svydesign(ids = ~ 1,
+                     weights = ~ weight,
+                     strata = ~ size + nace + region,
+                     data = jvs)
+```
+
+
+# IPW -- estymator odwrotnego prawdopodobieństwa
+
+Metoda IPW (Inverse Probability Weighting) koryguje obciążenie próby nielosowej przez modelowanie prawdopodobieństwa włączenia do próby $\pi(\mathbf{x}, \boldsymbol{\gamma})$.
+
+## Model z jedną zmienną
+
+Modelujemy $P(R_A = 1 | \text{size})$ za pomocą regresji logistycznej.
+
+```{r}
+ipw_est1 <- nonprob(
+  selection = ~ size,
+  target = ~ single_shift,
+  svydesign = jvs_svy,
+  data = admin,
+  method_selection = "logit"
+)
+ipw_est1
+```
+
+Podsumowanie modelu i wyniki estymacji.
+
+```{r}
+summary(ipw_est1)
+```
+
+Wyciągamy oszacowania punktowe i przedziały ufności.
+
+```{r}
+extract(ipw_est1)
+```
+
+Współczynniki modelu selekcji.
+
+```{r}
+coef(ipw_est1)
+```
+
+Rozkład wag IPW -- każda kategoria `size` ma swoją wagę.
+
+```{r}
+weights(ipw_est1) |> table()
+```
+
+Diagnostyka zbalansowania -- sprawdzamy czy po przeważeniu rozkłady zmiennych są zgodne.
+
+```{r}
+check_balance(~ size - 1, ipw_est1)
+check_balance(~ private, ipw_est1)
+```
+
+Wykres diagnostyczny modelu.
+
+```{r}
+plot(ipw_est1)
+```
+
+
+## Model z wieloma zmiennymi
+
+Rozszerzamy model selekcji o wszystkie dostępne zmienne: $P(R_A = 1 | \text{size, nace, region, private})$.
+
+```{r}
+ipw_est2 <- nonprob(
+  selection = ~ size + nace + region + private,
+  target = ~ single_shift,
+  svydesign = jvs_svy,
+  data = admin,
+  method_selection = "logit"
+)
+```
+
+Porównanie wyników obu modeli.
+
+```{r}
+rbind(ipw_est1$output, ipw_est2$output)
+```
+
+Współczynniki rozszerzonego modelu.
+
+```{r}
+coef(ipw_est2)
+summary(ipw_est2)
+```
+
+Rozkład wag -- więcej zmiennych daje bardziej zróżnicowane wagi.
+
+```{r}
+weights(ipw_est2) |> hist(breaks = "fd", main = "Rozkład wag IPW (pełny model)")
+```
+
+Porównanie zbalansowania: model prosty vs pełny.
+
+```{r}
+check_balance(~ size - 1, ipw_est1)
+check_balance(~ size - 1, ipw_est2)
+```
+
+## Diagnostyka z pakietem cobalt
+
+Wizualizacja zbalansowania za pomocą pakietu `cobalt` -- model z jedną zmienną.
+
+```{r}
+ipw_est1_comp <- as.weightit(
+  x = 1 / ipw_est1$ps_scores,
+  treat = ipw_est1$R,
+  covs = rbind(admin[, c("nace", "region", "size", "private")],
+               jvs[, c("nace", "region", "size", "private")])
+)
+bal.tab(ipw_est1_comp, un = TRUE) |> plot()
+```
+
+Wizualizacja zbalansowania -- model z wieloma zmiennymi.
+
+```{r}
+ipw_est2_comp <- as.weightit(
+  x = 1 / ipw_est2$ps_scores,
+  treat = ipw_est2$R,
+  covs = rbind(admin[, c("nace", "region", "size", "private")],
+               jvs[, c("nace", "region", "size", "private")])
+)
+bal.tab(ipw_est2_comp, un = TRUE) |> plot()
+```
+
+
+# Kalibrowany estymator IPW (GEE)
+
+Metoda GEE (Generalized Estimating Equations) gwarantuje, że wagi odtwarzają znane lub estymowane wartości globalne zmiennych pomocniczych. Jest to istotne, gdy standardowe wagi MLE nie sumują się do znanych wielkości populacyjnych.
+
+## MLE vs GEE -- jedna zmienna
+
+Standardowy IPW (MLE).
+
+```{r}
+ipw_mle <- nonprob(
+  selection = ~ size,
+  target = ~ single_shift,
+  svydesign = jvs_svy,
+  data = admin,
+  method_selection = "logit"
+)
+ipw_mle
+```
+
+Kalibrowany IPW (GEE) -- dodajemy `control_sel(est_method = "gee")`.
+
+```{r}
+ipw_gee <- nonprob(
+  selection = ~ size,
+  target = ~ single_shift,
+  svydesign = jvs_svy,
+  data = admin,
+  method_selection = "logit",
+  control_selection = control_sel(est_method = "gee")
+)
+ipw_gee
+```
+
+GEE zapewnia zgodność rozkładów -- porównanie balance.
+
+```{r}
+check_balance(~ size - 1, ipw_mle)
+check_balance(~ size - 1, ipw_gee)
+```
+
+Porównanie współczynników.
+
+```{r}
+coef(ipw_mle)
+coef(ipw_gee)
+```
+
+## MLE vs GEE -- wiele zmiennych
+
+```{r}
+ipw_mle2 <- nonprob(
+  selection = ~ size + nace + region + private,
+  target = ~ single_shift,
+  svydesign = jvs_svy,
+  data = admin,
+  method_selection = "logit"
+)
+
+ipw_gee2 <- nonprob(
+  selection = ~ size + nace + region + private,
+  target = ~ single_shift,
+  svydesign = jvs_svy,
+  data = admin,
+  method_selection = "logit",
+  control_selection = control_sel(est_method = "gee")
+)
+```
+
+Porównanie oszacowań.
+
+```{r}
+rbind(extract(ipw_mle2), extract(ipw_gee2))
+```
+
+Porównanie wag -- GEE daje bardziej stabilne wagi.
+
+```{r}
+plot(x = weights(ipw_mle2),
+     y = weights(ipw_gee2),
+     xlab = "Wagi MLE", ylab = "Wagi GEE")
+```
+
+```{r}
+summary(weights(ipw_mle2))
+summary(weights(ipw_gee2))
+```
+
+Zbalansowanie -- GEE gwarantuje zgodność.
+
+```{r}
+check_balance(~ size - 1, ipw_mle2)
+check_balance(~ size - 1, ipw_gee2)
+```
+
+## GEE z wartościami globalnymi (pop_totals)
+
+Gdy nie mamy danych jednostkowych z próby losowej, ale znamy sumy populacyjne, podajemy je przez `pop_totals`.
+
+```{r}
+pop_totals <- c("(Intercept)" = 51870, sizeM = 13758, sizeS = 29551)
+
+ipw_gee3 <- nonprob(
+  selection = ~ size,
+  target = ~ single_shift,
+  pop_totals = pop_totals,
+  data = admin,
+  method_selection = "logit",
+  control_selection = control_sel(est_method = "gee")
+)
+ipw_gee3
+```
+
+Porównanie: GEE z danymi jednostkowymi vs GEE z wartościami globalnymi.
+
+```{r}
+rbind(extract(ipw_gee), extract(ipw_gee3))
+```
+
+
+# Imputacja -- najbliższy sąsiad (NN)
+
+Metoda NN (Nearest Neighbor) imputuje wartości zmiennej celu na podstawie najbardziej podobnych obserwacji z próby losowej.
+
+## NN -- dopasowanie podstawowe
+
+```{r}
+mi_nn <- nonprob(
+  data = admin,
+  outcome = single_shift ~ size,
+  svydesign = jvs_svy,
+  method_outcome = "nn"
+)
+mi_nn
+```
+
+## NN -- model binarny z k = 1
+
+Ustawiamy `family_outcome = "binomial"` (zmienna binarna) i `k = 1` (jeden najbliższy sąsiad).
+
+```{r}
+mi_nn2 <- nonprob(
+  data = admin,
+  outcome = single_shift ~ size,
+  svydesign = jvs_svy,
+  method_outcome = "nn",
+  family_outcome = "binomial",
+  control_outcome = control_out(k = 1)
+)
+mi_nn2
+```
+
+
+# Imputacja -- Predictive Mean Matching (PMM)
+
+PMM dobiera dawcę na podstawie najbliższych wartości przewidywanych z modelu regresji.
+
+## PMM -- podstawowy
+
+```{r}
+mi_pmm <- nonprob(
+  data = admin,
+  outcome = single_shift ~ size,
+  svydesign = jvs_svy,
+  method_outcome = "pmm",
+  se = FALSE
+)
+mi_pmm
+```
+
+## PMM -- model binarny z k = 1
+
+```{r}
+mi_pmm2 <- nonprob(
+  data = admin,
+  outcome = single_shift ~ size,
+  svydesign = jvs_svy,
+  method_outcome = "pmm",
+  se = FALSE,
+  family_outcome = "binomial",
+  control_outcome = control_out(k = 1)
+)
+mi_pmm2
+```
+
+
+# Masowa imputacja -- model GLM
+
+Masowa imputacja (Mass Imputation) z wykorzystaniem uogólnionego modelu liniowego. Model estymowany na próbie nielosowej służy do predykcji wartości w próbie losowej.
+
+## GLM -- regresja liniowa
+
+```{r}
+mi_glm <- nonprob(
+  data = admin,
+  outcome = single_shift ~ size,
+  svydesign = jvs_svy,
+  method_outcome = "glm"
+)
+mi_glm
+```
+
+## GLM -- regresja logistyczna
+
+Dla zmiennej binarnej stosujemy `family_outcome = "binomial"`.
+
+```{r}
+mi_glm2 <- nonprob(
+  data = admin,
+  outcome = single_shift ~ size,
+  svydesign = jvs_svy,
+  method_outcome = "glm",
+  family_outcome = "binomial"
+)
+mi_glm2
+```
+
+
+# Estymator podwójnie odporny (DR)
+
+Estymator DR (Doubly Robust) łączy model selekcji (IPW) z modelem zmiennej wynikowej (MI). Jest odporny na błędną specyfikację jednego z dwóch modeli.
+
+## DR z regresją liniową
+
+Podajemy zarówno `selection` (model selekcji) jak i `outcome` (model wyniku).
+
+```{r}
+mi_dr <- nonprob(
+  data = admin,
+  outcome = single_shift ~ size + nace,
+  selection = ~ size + nace,
+  svydesign = jvs_svy,
+  method_outcome = "glm"
+)
+mi_dr
+```
+
+## DR z regresją logistyczną
+
+```{r}
+mi_dr2 <- nonprob(
+  data = admin,
+  outcome = single_shift ~ size + nace,
+  selection = ~ size + nace,
+  svydesign = jvs_svy,
+  method_outcome = "glm",
+  family_outcome = "binomial"
+)
+mi_dr2
+```
